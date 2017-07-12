@@ -39,6 +39,10 @@ try:
     _CRLock = _thread.RLock
 except AttributeError:
     _CRLock = None
+try:
+    _CCondition = _thread.Condition
+except AttributeError:
+    _CCondition = None
 TIMEOUT_MAX = _thread.TIMEOUT_MAX
 del _thread
 
@@ -201,7 +205,23 @@ class _RLock:
 _PyRLock = _RLock
 
 
-class Condition:
+def Condition(*args, **kwargs):
+    """Factory function that returns a new condition object.
+
+    A condition variable allows one or more threads to wait until they are
+    notified by another thread.
+
+    If the lock argument is given and not None, it must be a Lock or RLock
+    object, and it is used as the underlying lock. Otherwise, a new RLock object
+    is created and used as the underlying lock.
+
+    """
+    if _CCondition is None:
+        return _PyCondition(*args, **kwargs)
+    return _CCondition(*args, **kwargs)
+
+
+class _Condition:
     """Class that implements a condition variable.
 
     A condition variable allows one or more threads to wait until they are
@@ -353,6 +373,9 @@ class Condition:
         self.notify(len(self._waiters))
 
     notifyAll = notify_all
+
+
+_PyCondition = _Condition
 
 
 class Semaphore:

@@ -204,6 +204,25 @@ PyDoc_STRVAR(locked_doc,
 Return whether the lock is in the locked state.");
 
 static PyObject *
+lock_acquire_restore(lockobject *self, PyObject *args)
+{
+    int r = 1;
+
+    if (!PyThread_acquire_lock(self->lock_lock, 0)) {
+        Py_BEGIN_ALLOW_THREADS
+        r = PyThread_acquire_lock(self->lock_lock, 1);
+        Py_END_ALLOW_THREADS
+    }
+    if (!r) {
+        PyErr_SetString(ThreadError, "couldn't acquire lock");
+        return NULL;
+    }
+
+    self->lock_owner = PyThread_get_thread_ident();
+    Py_RETURN_NONE;
+}
+
+static PyObject *
 lock_repr(lockobject *self)
 {
     return PyUnicode_FromFormat("<%s %s object owner=%ld at %p>",
@@ -240,6 +259,12 @@ static PyMethodDef lock_methods[] = {
      METH_NOARGS, locked_doc},
     {"locked",       (PyCFunction)lock_locked_lock,
      METH_NOARGS, locked_doc},
+    {"_is_owned",     (PyCFunction)lock_is_owned,
+     METH_NOARGS, NULL},
+    {"_acquire_restore", (PyCFunction)lock_acquire_restore,
+     METH_VARARGS, NULL},
+    {"_release_save", (PyCFunction)lock_PyThread_release_lock,
+     METH_NOARGS, NULL},
     {"__enter__",    (PyCFunction)lock_PyThread_acquire_lock,
      METH_VARARGS | METH_KEYWORDS, acquire_doc},
     {"__exit__",    (PyCFunction)lock_PyThread_release_lock,
@@ -568,6 +593,518 @@ newlockobject(void)
     }
     return self;
 }
+
+/* waiter */
+
+#define WAITER_UNUSED ((struct waiter *) -1)
+
+struct waiter {
+    PyThread_type_lock lock;
+    struct waiter *next;
+    struct waiter *prev;
+};
+
+static int
+waiter_init(struct waiter *waiter)
+{
+    waiter->next = waiter->prev = WAITER_UNUSED;
+
+    waiter->lock = PyThread_allocate_lock();
+    if (waiter->lock == NULL) {
+        PyErr_SetString(ThreadError, "can't allocate lock");
+        return -1;
+    }
+
+    if (!PyThread_acquire_lock(waiter->lock, 0)) {
+        PyErr_SetString(ThreadError, "can't acquire lock");
+        PyThread_free_lock(waiter->lock);
+        return -1;
+    }
+
+    return 0;
+}
+
+static void
+waiter_destroy(struct waiter *waiter)
+{
+    assert(waiter->next == WAITER_UNUSED && waiter->prev == WAITER_UNUSED);
+
+    if (waiter->lock != NULL) {
+        PyThread_release_lock(waiter->lock);
+        PyThread_free_lock(waiter->lock);
+        waiter->lock = NULL;
+    }
+}
+
+/* waitq */
+
+struct waitq {
+    struct waiter *first;
+    struct waiter *last;
+    int count;
+};
+
+static void
+waitq_init(struct waitq *waitq)
+{
+    waitq->first = waitq->last = NULL;
+    waitq->count = 0;
+}
+
+static void
+waitq_append(struct waitq *waitq, struct waiter *waiter)
+{
+    assert(waiter->next == WAITER_UNUSED && waiter->prev == WAITER_UNUSED);
+
+    waiter->next = NULL;
+    waiter->prev = waitq->last;
+
+    if (waitq->last)
+        waitq->last->next = waiter;
+    else
+        waitq->first = waiter;
+
+    waitq->last = waiter;
+
+    waitq->count++;
+}
+
+static void
+waitq_remove(struct waitq *waitq, struct waiter *waiter)
+{
+    if (waiter->next == WAITER_UNUSED)
+        return;
+
+    if (waiter->prev)
+        waiter->prev->next = waiter->next;
+    else
+        waitq->first = waiter->next;
+
+    if (waiter->next)
+        waiter->next->prev = waiter->prev;
+    else
+        waitq->last = waiter->prev;
+
+    waiter->prev = waiter->next = WAITER_UNUSED;
+
+    waitq->count--;
+    assert(waitq->count >= 0);
+}
+
+/* Condition */
+
+typedef struct {
+    PyObject_HEAD
+    PyObject *lock;
+    PyObject *acquire;
+    PyObject *release;
+    PyObject *is_owned;
+    PyObject *release_save;
+    PyObject *acquire_restore;
+    struct waitq waiters;
+    PyObject *in_weakreflist;
+} condobject;
+
+static int
+cond_init(condobject *self, PyObject *args, PyObject *kwds)
+{
+    PyObject *lock = Py_None;
+    PyObject *acquire = NULL;
+    PyObject *release = NULL;
+    PyObject *is_owned = NULL;
+    PyObject *release_save = NULL;
+    PyObject *acquire_restore = NULL;
+    PyObject *tmp = NULL;
+    static char *kwlist[] = {"lock", NULL};
+
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "|O", kwlist, &lock))
+        return -1;
+
+    if (lock == Py_None) {
+        lock = PyObject_CallObject((PyObject *)&RLocktype, NULL);
+        if (lock == NULL)
+            return -1;
+    } else {
+        Py_INCREF(lock);
+    }
+
+    tmp = self->lock;
+    self->lock = lock;
+    Py_CLEAR(tmp);
+
+    acquire = PyObject_GetAttrString(self->lock, "acquire");
+    if (acquire == NULL)
+        return -1;
+
+    tmp = self->acquire;
+    self->acquire = acquire;
+    Py_CLEAR(tmp);
+
+    release = PyObject_GetAttrString(self->lock, "release");
+    if (release == NULL)
+        return -1;
+
+    tmp = self->release;
+    self->release = release;
+    Py_CLEAR(tmp);
+
+    is_owned = PyObject_GetAttrString(self->lock, "_is_owned");
+    if (is_owned == NULL)
+        return -1;
+
+    tmp = self->is_owned;
+    self->is_owned = is_owned;
+    Py_CLEAR(tmp);
+
+    release_save = PyObject_GetAttrString(self->lock, "_release_save");
+    if (release_save == NULL)
+        return -1;
+
+    tmp = self->release_save;
+    self->release_save = release_save;
+    Py_CLEAR(tmp);
+
+    acquire_restore = PyObject_GetAttrString(self->lock, "_acquire_restore");
+    if (acquire_restore == NULL)
+        return -1;
+
+    tmp = self->acquire_restore;
+    self->acquire_restore = acquire_restore;
+    Py_CLEAR(tmp);
+
+    waitq_init(&self->waiters);
+
+    return 0;
+}
+
+static void
+cond_dealloc(condobject *self)
+{
+    assert(self->waiters.first == NULL && self->waiters.last == NULL);
+
+    if (self->in_weakreflist)
+        PyObject_ClearWeakRefs((PyObject *) self);
+
+    Py_CLEAR(self->lock);
+    Py_CLEAR(self->acquire);
+    Py_CLEAR(self->release);
+    Py_CLEAR(self->is_owned);
+    Py_CLEAR(self->release_save);
+    Py_CLEAR(self->acquire_restore);
+
+    PyObject_Del(self);
+}
+
+static PyObject *
+cond_acquire(condobject *self, PyObject *args, PyObject *kwds)
+{
+    assert(args != NULL);
+    return PyObject_Call(self->acquire, args, kwds);
+}
+
+static PyObject *
+cond_release(condobject *self, PyObject *args)
+{
+    return PyObject_CallObject(self->release, NULL);
+}
+
+static int
+cond_is_owned_internal(condobject *self)
+{
+    PyObject *r;
+    int is_owned;
+
+    r = PyObject_CallObject(self->is_owned, NULL);
+    is_owned = (r == Py_True);
+    Py_CLEAR(r);
+
+    return is_owned;
+}
+
+static int
+cond_wait_parse_timeout(PyObject *obj, _PyTime_t *timeout)
+{
+    const _PyTime_t unset_timeout = _PyTime_FromSeconds(-1);
+    _PyTime_t microseconds;
+
+    if (obj == Py_None) {
+        *timeout = unset_timeout;
+        return 0;
+    }
+
+    if (_PyTime_FromSecondsObject(timeout, obj, _PyTime_ROUND_CEILING) < 0)
+        return -1;
+
+    if (*timeout == unset_timeout)
+        return 0;
+
+    if (*timeout < 0) {
+        PyErr_SetString(PyExc_ValueError, "timeout value must be positive");
+        return -1;
+    }
+
+    microseconds = _PyTime_AsMicroseconds(*timeout, _PyTime_ROUND_CEILING);
+    if (microseconds >= PY_TIMEOUT_MAX) {
+        PyErr_SetString(PyExc_OverflowError, "timeout value is too large");
+        return -1;
+    }
+
+    return 0;
+}
+
+static PyObject *
+cond_wait_released(condobject *self, struct waiter *waiter, _PyTime_t timeout)
+{
+    PyObject *saved_state = NULL;
+    PyObject *r = NULL;
+    PyLockStatus status;
+
+    saved_state = PyObject_CallObject(self->release_save, NULL);
+    if (saved_state == NULL)
+        return NULL;
+
+    status = acquire_timed(waiter->lock, timeout);
+
+    r = PyObject_CallFunctionObjArgs(self->acquire_restore, saved_state, NULL);
+    Py_CLEAR(saved_state);
+    if (r == NULL)
+        return NULL;
+
+    Py_CLEAR(r);
+    if (status == PY_LOCK_INTR)
+        return NULL;
+
+    return PyBool_FromLong(status == PY_LOCK_ACQUIRED);
+}
+
+static PyObject *
+cond_wait_internal(condobject *self, _PyTime_t timeout)
+{
+    struct waiter waiter;
+    PyObject *res;
+
+    if (!cond_is_owned_internal(self)) {
+        PyErr_SetString(PyExc_RuntimeError,
+                        "cannot wait on un-acquired condition");
+        return NULL;
+    }
+
+    if (waiter_init(&waiter) != 0)
+        return NULL;
+
+    waitq_append(&self->waiters, &waiter);
+
+    res = cond_wait_released(self, &waiter, timeout);
+
+    if (res != Py_True)
+        waitq_remove(&self->waiters, &waiter);
+
+    waiter_destroy(&waiter);
+
+    return res;
+}
+
+static PyObject *
+cond_wait(condobject *self, PyObject *args, PyObject *kwds)
+{
+    char *kwlist[] = {"timeout", NULL};
+    PyObject *obj = Py_None;
+    _PyTime_t timeout;
+
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "|O:wait", kwlist,
+                                     &obj))
+        return NULL;
+
+    if (cond_wait_parse_timeout(obj, &timeout) != 0)
+        return NULL;
+
+    return cond_wait_internal(self, timeout);
+}
+
+static PyObject *
+cond_wait_for(condobject *self, PyObject *args, PyObject *kwds)
+{
+    char *kwlist[] = {"predicate", "timeout", NULL};
+    PyObject *predicate;
+    PyObject *timeout = Py_None;
+    _PyTime_t waittime;
+    _PyTime_t endtime = -1;
+    int done;
+    PyObject *r = NULL;
+    PyObject *res = NULL;
+
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "O|O:wait_for", kwlist,
+                                     &predicate, &timeout))
+        return NULL;
+
+    if (cond_wait_parse_timeout(timeout, &waittime) != 0)
+        return NULL;
+
+    for (;;) {
+        res = PyObject_CallObject(predicate, NULL);
+        if (res == NULL)
+            goto error;
+
+        done = PyObject_IsTrue(res);
+        if (done == -1)
+            goto error;
+
+        if (done)
+            break;
+
+        if (waittime >= 0) {
+            if (endtime == -1) {
+                _PyTime_t now = _PyTime_GetMonotonicClock();
+                if (now <= _PyTime_MAX - waittime)
+                    endtime = now + waittime;
+                else
+                    endtime = _PyTime_MAX;
+            } else {
+                waittime = endtime - _PyTime_GetMonotonicClock();
+                if (waittime <= 0)
+                    break;
+            }
+        }
+
+        r = cond_wait_internal(self, waittime);
+        if (r == NULL)
+            goto error;
+
+        Py_CLEAR(r);
+        Py_CLEAR(res);
+    }
+
+    return res;
+
+error:
+    Py_CLEAR(res);
+    return NULL;
+}
+
+static PyObject *
+cond_notify_internal(condobject *self, int count)
+{
+    int i;
+
+    if (!cond_is_owned_internal(self)) {
+        PyErr_SetString(PyExc_RuntimeError,
+                        "cannot notify un-acquired condition");
+        return NULL;
+    }
+
+    for (i = 0; i < count && self->waiters.first != NULL; i++) {
+        struct waiter *waiter = self->waiters.first;
+        PyThread_release_lock(waiter->lock);
+        waitq_remove(&self->waiters, waiter);
+    }
+
+    Py_RETURN_NONE;
+}
+
+static PyObject *
+cond_notify(condobject *self, PyObject *args, PyObject *kwds)
+{
+    char *kwlist[] = {"n", NULL};
+    int count = 1;
+
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "|i:n", kwlist,
+                                     &count))
+        return NULL;
+
+    return cond_notify_internal(self, count);
+}
+
+static PyObject *
+cond_notify_all(condobject *self)
+{
+    return cond_notify_internal(self, self->waiters.count);
+}
+
+static PyObject *
+cond_repr(condobject *self)
+{
+    return PyUnicode_FromFormat("<%s(%S, %d)>",
+        Py_TYPE(self)->tp_name, self->lock, self->waiters.count);
+}
+
+/* For the regresion tests */
+
+static PyObject *
+cond_is_owned(condobject *self)
+{
+    return PyObject_CallObject(self->is_owned, NULL);
+}
+
+static PyObject *
+cond_release_save(condobject *self)
+{
+    return PyObject_CallObject(self->release_save, NULL);
+}
+
+static PyObject *
+cond_acquire_restore(condobject *self, PyObject *args)
+{
+    return PyObject_CallObject(self->acquire_restore, args);
+}
+
+static PyMethodDef cond_methods[] = {
+    {"acquire", (PyCFunction)cond_acquire, METH_VARARGS | METH_KEYWORDS, NULL},
+    {"release", (PyCFunction)cond_release, METH_VARARGS, NULL},
+    {"wait", (PyCFunction)cond_wait, METH_VARARGS | METH_KEYWORDS, NULL},
+    {"wait_for", (PyCFunction)cond_wait_for, METH_VARARGS | METH_KEYWORDS, NULL},
+    {"notify", (PyCFunction)cond_notify, METH_VARARGS | METH_KEYWORDS , NULL},
+    {"notify_all", (PyCFunction)cond_notify_all, METH_VARARGS, NULL},
+    {"notifyAll", (PyCFunction)cond_notify_all, METH_VARARGS, NULL},
+    {"__enter__", (PyCFunction)cond_acquire, METH_VARARGS | METH_KEYWORDS, NULL},
+    {"__exit__", (PyCFunction)cond_release, METH_VARARGS, NULL},
+    {"_is_owned", (PyCFunction)cond_is_owned, METH_NOARGS, NULL},
+    {"_release_save", (PyCFunction)cond_release_save, METH_NOARGS, NULL},
+    {"_acquire_restore", (PyCFunction)cond_acquire_restore, METH_VARARGS, NULL},
+    {NULL}  /* Sentinel */
+};
+
+static PyTypeObject Conditiontype = {
+    PyVarObject_HEAD_INIT(&PyType_Type, 0)
+    "_thread.Condition",                /*tp_name*/
+    sizeof(condobject),                 /*tp_size*/
+    0,                                  /*tp_itemsize*/
+    /* methods */
+    (destructor)cond_dealloc,           /*tp_dealloc*/
+    0,                                  /*tp_print*/
+    0,                                  /*tp_getattr*/
+    0,                                  /*tp_setattr*/
+    0,                                  /*tp_reserved*/
+    (reprfunc)cond_repr,                /*tp_repr*/
+    0,                                  /*tp_as_number*/
+    0,                                  /*tp_as_sequence*/
+    0,                                  /*tp_as_mapping*/
+    0,                                  /*tp_hash*/
+    0,                                  /*tp_call*/
+    0,                                  /*tp_str*/
+    0,                                  /*tp_getattro*/
+    0,                                  /*tp_setattro*/
+    0,                                  /*tp_as_buffer*/
+    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE, /* tp_flags */
+    0,                                  /*tp_doc*/
+    0,                                  /*tp_traverse*/
+    0,                                  /*tp_clear*/
+    0,                                  /*tp_richcompare*/
+    offsetof(condobject, in_weakreflist), /*tp_weaklistoffset*/
+    0,                                  /*tp_iter*/
+    0,                                  /*tp_iternext*/
+    cond_methods,                       /*tp_methods*/
+    0,                                  /* tp_members */
+    0,                                  /* tp_getset */
+    0,                                  /* tp_base */
+    0,                                  /* tp_dict */
+    0,                                  /* tp_descr_get */
+    0,                                  /* tp_descr_set */
+    0,                                  /* tp_dictoffset */
+    (initproc)cond_init,                /* tp_init */
+    0,                                  /* tp_init */
+    0,                                  /* tp_alloc */
+    0                                   /* tp_new */
+};
 
 /* Thread-local objects */
 
@@ -1381,6 +1918,10 @@ PyInit__thread(void)
     if (PyType_Ready(&RLocktype) < 0)
         return NULL;
 
+    Conditiontype.tp_new = PyType_GenericNew;
+    if (PyType_Ready(&Conditiontype) < 0)
+        return NULL;
+
     /* Create the module and add the functions */
     m = PyModule_Create(&threadmodule);
     if (m == NULL)
@@ -1408,6 +1949,10 @@ PyInit__thread(void)
 
     Py_INCREF(&RLocktype);
     if (PyModule_AddObject(m, "RLock", (PyObject *)&RLocktype) < 0)
+        return NULL;
+
+    Py_INCREF(&Conditiontype);
+    if (PyModule_AddObject(m, "Condition", (PyObject *)&Conditiontype) < 0)
         return NULL;
 
     Py_INCREF(&localtype);
