@@ -1292,6 +1292,10 @@ class MemoryHandler(BufferingHandler):
     def setTarget(self, target):
         """
         Set the target handler for this handler.
+
+        For best results, target handler should override "autoflush" to False.
+        This will avoid unneccesary flushing when the memory handler flushes
+        the buffered message to the target.
         """
         self.target = target
 
@@ -1308,6 +1312,8 @@ class MemoryHandler(BufferingHandler):
             if self.target:
                 for record in self.buffer:
                     self.target.handle(record)
+                if not target.autoflush:
+                    self.target.flush()
                 self.buffer = []
         finally:
             self.release()

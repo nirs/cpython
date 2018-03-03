@@ -759,6 +759,12 @@ class Handler(Filterer):
     records as desired. By default, no formatter is specified; in this case,
     the 'raw' message as determined by record.message is logged.
     """
+
+    # If set to True, flush() is called for every emit(). Subclasses that want
+    # to minimized flushing, for example when used as MemoryHandler target can
+    # override this.
+    autoflush = True
+
     def __init__(self, level=NOTSET):
         """
         Initializes the instance - basically setting the formatter to None
@@ -983,7 +989,8 @@ class StreamHandler(Handler):
             stream = self.stream
             stream.write(msg)
             stream.write(self.terminator)
-            self.flush()
+            if self.autoflush:
+                self.flush()
         except Exception:
             self.handleError(record)
 
